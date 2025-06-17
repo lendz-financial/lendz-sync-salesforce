@@ -6,9 +6,9 @@ import os
 #app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 app = func.FunctionApp()
 
-@app.function_name("ExampleFunction")
-@app.route(route="examplefunction")
-def example_function_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
+@app.function_name("SalesforceSyncFunction1")
+@app.route(route="salesforcesyncfunction1")
+def salesforce_sync_function_1(req: func.HttpRequest) -> func.HttpResponse:
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
     logging.info("Your example function was successfully triggered.")
@@ -27,28 +27,7 @@ def example_function_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
     logger.info("Finished execution.")
     return func.HttpResponse()
 
-@app.function_name("AnotherExampleFunction")
-@app.route(route="anotherexamplefunction")
-def another_example_function_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
-    logging.info("Another example function was successfully triggered.")
 
-    # do something with the req argument
-    events = req.get_json()
-    logger.info(f"Request body:\n{events}")
-
-    # execute imported functions
-    helper_code()
-
-    # put your own code here ...
-
-    # finish execution
-    logger.info("Finished execution.")
-    return func.HttpResponse()
-
-
-#app = func.FunctionApp()
 
 @app.timer_trigger(schedule="0 0 14,18,22 * * *", arg_name="myTimer", run_on_startup=False,
               use_monitor=False) 

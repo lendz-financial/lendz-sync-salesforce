@@ -1,1 +1,4 @@
 azure-functions
+simple-salesforce
+pandas
+# The above packages are required for the Azure Function to interact with Salesforce
