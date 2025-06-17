@@ -210,7 +210,7 @@ def download_content_versions_and_files_to_azure_blob(
             except Exception as e:
                 print(f"Error closing Salesforce session: {e}")
 
-# --- Example Usage ---
+# --- Example Usage ----
 if __name__ == "__main__":
     # Set these environment variables before running the script:
     # export AZURE_STORAGE_ACCOUNT_NAME="your_storage_account_name"
