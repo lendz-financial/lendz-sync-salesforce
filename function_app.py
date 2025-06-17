@@ -1,8 +1,10 @@
 import azure.functions as func
 from code_to_import import helper_code
 import logging
+import os
 
-app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+#app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+app = func.FunctionApp()
 
 @app.function_name("ExampleFunction")
 @app.route(route="examplefunction")
@@ -44,3 +46,16 @@ def another_example_function_http_trigger(req: func.HttpRequest) -> func.HttpRes
     # finish execution
     logger.info("Finished execution.")
     return func.HttpResponse()
+
+
+#app = func.FunctionApp()
+
+@app.timer_trigger(schedule="0 0 14,18,22 * * *", arg_name="myTimer", run_on_startup=False,
+              use_monitor=False) 
+def lendz_sync_salesforce(myTimer: func.TimerRequest) -> None:
+    logging.info('====== sync_loanpass function executed.')
+    my_connection_string = os.getenv('SQL_CONNECTION_STRING')
+    if not my_connection_string:
+        raise ValueError("SQL_CONNECTION_STRING environment variable not set. Please set it before running the script.")
+    # Call the new orchestrating function to fetch data from LoanPASS API and process it
+    helper_code()
