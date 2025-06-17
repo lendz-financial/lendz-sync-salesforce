@@ -19,6 +19,7 @@
             "env": {
                 "AZURE_STORAGE_ACCOUNT_NAME": "lendzpartnershare",
                 "AZURE_STORAGE_CONTAINER_NAME": "lendz-loan-documents",
+                "AZURE_SQL_CONNECTION_STRING": "DRIVER={ODBC Driver 17 for SQL Server};SERVER=lendz.database.windows.net;DATABASE=Lexi_DEV;UID=lexi;PWD=H3n4y*_D@",
                 "AZURE_STORAGE_ACCOUNT_KEY": "vDECnV3cOdTMbd6F6PCVXcPK6mc/JBMIqWFiJXdnbcmXR3bBzvpus+GXiikA+d6Ygf5dUGTYAmpC+AStc+bPaA==",
                 // OR use the connection string instead
                 // "AZURE_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=lendzpartnershare;AccountKey=vDECnV3cOdTMbd6F6PCVXcPK6mc/JBMIqWFiJXdnbcmXR3bBzvpus+GXiikA+d6Ygf5dUGTYAmpC+AStc+bPaA==;EndpointSuffix=core.windows.net",

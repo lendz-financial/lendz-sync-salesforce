@@ -2,4 +2,5 @@ azure-functions
 simple-salesforce
 pandas
 azure-storage-blob
+pyodbc
 # The above packages are required for the Azure Function to interact with Salesforce

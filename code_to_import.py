@@ -4,29 +4,67 @@ def helper_code() -> None:
     logging.info("Helper code function successfully executed. AB")
     
 import csv
-from io import StringIO, BytesIO # Added BytesIO
+from io import StringIO, BytesIO
 import os
 import requests
+import pyodbc
 from simple_salesforce import Salesforce, SalesforceError
-import pandas as pd # Optional: for easier data handling
+import pandas as pd
 
 # Azure Blob Storage imports
-from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
+from azure.storage.blob import BlobServiceClient
 from azure.core.exceptions import ResourceNotFoundError, ClientAuthenticationError
 
-def download_content_versions_and_files_to_azure_blob(
+def _execute_db_batch(cursor, cnxn, batch_data):
+    """
+    Executes a batch update for Azure SQL Database.
+    batch_data is a list of tuples: [(azure_blob_url, content_document_id), ...]
+    """
+    if not batch_data:
+        return 0 # No data to update
+
+    # Construct the VALUES clause dynamically
+    # Each item in VALUES will be (?, ?) for (AzureBlobUrl, ContentDocumentId)
+    values_placeholders = ', '.join(['(?, ?)' for _ in batch_data])
+    
+    # Flatten the parameters list for pyodbc
+    flat_params = []
+    for url, doc_id in batch_data:
+        flat_params.append(url)
+        flat_params.append(doc_id)
+
+    # SQL UPDATE statement using a VALUES clause for multiple rows
+    update_sql = f"""
+    UPDATE T
+    SET T.AzureBlobUrl = V.AzureBlobUrl
+    FROM [dbo].[ContentVersion] AS T
+    JOIN (VALUES {values_placeholders}) AS V(AzureBlobUrl, ContentDocumentId)
+        ON T.ContentDocumentId = V.ContentDocumentId;
+    """
+    
+    try:
+        cursor.execute(update_sql, *flat_params) # Unpack flat_params for cursor.execute
+        cnxn.commit()
+        return cursor.rowcount # Number of rows affected
+    except pyodbc.Error as sql_err:
+        cnxn.rollback()
+        print(f"  ERROR executing batch SQL DB update: {sql_err}")
+        return -1 # Indicate failure
+
+
+def download_content_versions_and_files_to_azure_blob_and_sql_batched(
     username, password, security_token, last_sync_timestamp, 
     sandbox=False
 ):
     """
-    Downloads ContentVersion objects from Salesforce using Bulk API 2.0
-    with a SystemModstamp greater than the provided timestamp,
-    and then uploads the associated files to Azure Blob Storage.
+    Downloads ContentVersion objects from Salesforce using Bulk API 2.0,
+    uploads files to Azure Blob Storage, and updates Azure SQL Database in batches.
 
-    Azure Storage Account Name and Container Name must be set as environment variables:
-    - AZURE_STORAGE_ACCOUNT_NAME
-    - AZURE_STORAGE_CONTAINER_NAME
-    - AZURE_STORAGE_ACCOUNT_KEY (or AZURE_STORAGE_CONNECTION_STRING)
+    Required Environment Variables:
+    - SF_USERNAME, SF_PASSWORD, SF_SECURITY_TOKEN (for Salesforce)
+    - AZURE_STORAGE_ACCOUNT_NAME, AZURE_STORAGE_CONTAINER_NAME, AZURE_STORAGE_ACCOUNT_KEY (for Azure Blob)
+    - AZURE_SQL_CONNECTION_STRING (for Azure SQL DB)
+    - AZURE_DB_BATCH_SIZE (optional, defaults to 50 if not set or invalid)
 
     Args:
         username (str): Salesforce username.
@@ -38,16 +76,28 @@ def download_content_versions_and_files_to_azure_blob(
                                   Defaults to False (production).
 
     Returns:
-        pandas.DataFrame or list: A Pandas DataFrame containing the downloaded records
-                                  (including the Azure Blob URL if successful),
+        pandas.DataFrame or list: A Pandas DataFrame containing the processed records
+                                  (including Azure Blob URL and SQL update status),
                                   if pandas is installed, otherwise a list of dictionaries.
-                                  Returns None if an error occurs.
+                                  Returns None if a critical error occurs.
     """
-    sf = None # Initialize sf to None
-    container_client = None # Initialize container_client to None
+    sf = None
+    container_client = None
+    cnxn = None
 
     try:
-        # 1. Authenticate with Salesforce
+        # --- Read Batch Size from Environment Variable ---
+        db_batch_size_str = os.environ.get('AZURE_DB_BATCH_SIZE', '50') # Default to 50
+        try:
+            db_batch_size = int(db_batch_size_str)
+            if db_batch_size <= 0:
+                raise ValueError("Batch size must be a positive integer.")
+        except ValueError as e:
+            # Fallback to default if environment variable is invalid
+            print(f"Warning: Invalid AZURE_DB_BATCH_SIZE environment variable '{db_batch_size_str}'. Defaulting to 50. Error: {e}")
+            db_batch_size = 50 
+
+        # --- Salesforce Connection ---
         sf = Salesforce(
             username=username,
             password=password,
@@ -56,34 +106,29 @@ def download_content_versions_and_files_to_azure_blob(
         )
         print(f"Successfully connected to Salesforce. API version: {sf.api_version}")
 
-        # 2. Get Azure Blob Storage credentials from environment variables
+        # --- Azure Blob Storage Setup ---
         azure_storage_account_name = os.environ.get('AZURE_STORAGE_ACCOUNT_NAME')
         azure_storage_container_name = os.environ.get('AZURE_STORAGE_CONTAINER_NAME')
-        azure_storage_account_key = os.environ.get('AZURE_STORAGE_ACCOUNT_KEY') # Prefer account key for simplicity here
-        azure_storage_connection_string = os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
+        azure_storage_account_key = os.environ.get('AZURE_STORAGE_ACCOUNT_KEY')
+        azure_storage_connection_string_blob = os.environ.get('AZURE_STORAGE_CONNECTION_STRING') # Renamed to avoid conflict
 
         if not azure_storage_account_name or not azure_storage_container_name:
             raise ValueError(
                 "Environment variables AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_CONTAINER_NAME must be set."
             )
-        if not azure_storage_account_key and not azure_storage_connection_string:
+        if not azure_storage_account_key and not azure_storage_connection_string_blob:
              raise ValueError(
-                "Either AZURE_STORAGE_ACCOUNT_KEY or AZURE_STORAGE_CONNECTION_STRING must be set."
+                "Either AZURE_STORAGE_ACCOUNT_KEY or AZURE_STORAGE_CONNECTION_STRING (for Blob) must be set."
             )
 
-        # 3. Initialize Azure Blob Service Client
         print("Initializing Azure Blob Storage client...")
-        if azure_storage_connection_string:
-            blob_service_client = BlobServiceClient.from_connection_string(azure_storage_connection_string)
+        if azure_storage_connection_string_blob:
+            blob_service_client = BlobServiceClient.from_connection_string(azure_storage_connection_string_blob)
         else:
-            # Construct the account URL from the account name
             account_url = f"https://{azure_storage_account_name}.blob.core.windows.net"
             blob_service_client = BlobServiceClient(account_url=account_url, credential=azure_storage_account_key)
 
-        # Get a client to interact with the specific container
         container_client = blob_service_client.get_container_client(azure_storage_container_name)
-        
-        # Check if container exists, create if not (optional, but good for first run)
         try:
             container_client.get_container_properties()
             print(f"Connected to existing Azure container: {azure_storage_container_name}")
@@ -92,10 +137,22 @@ def download_content_versions_and_files_to_azure_blob(
             container_client.create_container()
             print(f"Container '{azure_storage_container_name}' created.")
         except ClientAuthenticationError as auth_err:
-            raise ValueError(f"Azure authentication error: Check your storage account name/key/connection string. Details: {auth_err}")
+            raise ValueError(f"Azure authentication error for Blob Storage: {auth_err}")
 
+        # --- Azure SQL Database Setup ---
+        azure_sql_connection_string = os.environ.get('AZURE_SQL_CONNECTION_STRING')
 
-        # 4. Construct the SOQL query
+        if not azure_sql_connection_string:
+            raise ValueError(
+                "Environment variable AZURE_SQL_CONNECTION_STRING must be set for Azure SQL Database connection."
+            )
+        
+        print("Connecting to Azure SQL Database using connection string...")
+        cnxn = pyodbc.connect(azure_sql_connection_string)
+        cursor = cnxn.cursor()
+        print("Successfully connected to Azure SQL Database.")
+
+        # --- Salesforce SOQL Query ---
         soql_query = (
             f"SELECT Id, ContentDocumentId, IsLatest, ContentUrl, ContentBodyId, "
             f"VersionNumber, Title, Description, ReasonForChange, SharingOption, "
@@ -110,125 +167,178 @@ def download_content_versions_and_files_to_azure_blob(
         )
         print(f"Executing SOQL query: {soql_query}")
 
-        # 5. Execute the Bulk API query (Bulk 2.0)
+        # --- Execute Bulk API Query and Process Records ---
         job_result = sf.bulk.ContentVersion.query(soql_query)
 
         session_id = sf.session_id
         processed_records = []
+        db_update_batch = [] 
+        
         download_count = 0
         record_count = 0
+        sql_batch_update_count = 0
 
-        print("Starting file downloads and Azure Blob uploads...")
-        # 6. Iterate directly through job_result and upload files to Azure
+        print(f"Starting file downloads, Azure Blob uploads, and Azure SQL updates (batch size: {db_batch_size})...")
         for record in job_result:
             record_count += 1
             version_data_url = record.get('VersionDataUrl')
             file_extension = record.get('FileExtension')
             title = record.get('Title')
             content_version_id = record.get('Id')
+            content_document_id = record.get('ContentDocumentId')
 
-            if version_data_url:
-                full_download_url = version_data_url # Using VersionDataUrl directly as the full URL
+            record['AzureBlobUrl'] = None
+            record['DownloadError'] = None
+            record['SqlUpdateStatus'] = 'Skipped' 
+
+            if version_data_url and content_document_id:
+                full_download_url = version_data_url 
                 
-                # Sanitize filename for common OS/URL compatibility issues and use as blob_name
-                # Azure Blob names are case-sensitive and can contain most characters,
-                # but it's good practice to avoid ones that are problematic in URLs or OS paths.
                 safe_title = "".join([c for c in (title or content_version_id) if c.isalnum() or c in (' ', '.', '_', '-')]).strip()
                 blob_name = f"{safe_title}"
                 if file_extension:
                     blob_name = f"{blob_name}.{file_extension}"
                 else:
-                    blob_name = f"{blob_name}.bin" # Generic binary extension
-
-                # Replace spaces with underscores or dashes for cleaner blob names in URLs
+                    blob_name = f"{blob_name}.bin"
                 blob_name = blob_name.replace(' ', '_') 
-                # Add ContentVersion ID to ensure uniqueness, useful for versions with same title
                 blob_name = f"{content_version_id}_{blob_name}"
 
                 azure_blob_url = f"https://{azure_storage_account_name}.blob.core.windows.net/{azure_storage_container_name}/{blob_name}"
 
                 try:
+                    # --- Download File ---
                     headers = {
                         'Authorization': f'Bearer {session_id}'
                     }
-                    
                     response = requests.get(full_download_url, headers=headers, stream=True)
                     response.raise_for_status()
 
-                    # Use BytesIO to buffer the file content in memory
                     file_content_buffer = BytesIO()
                     for chunk in response.iter_content(chunk_size=8192):
                         file_content_buffer.write(chunk)
-                    
-                    # Reset buffer position to the beginning before uploading
                     file_content_buffer.seek(0)
 
-                    # Upload the buffered content to Azure Blob
+                    # --- Upload to Azure Blob ---
                     blob_client = container_client.get_blob_client(blob_name)
-                    blob_client.upload_blob(file_content_buffer, overwrite=True) # overwrite=True allows re-uploading same file name
+                    blob_client.upload_blob(file_content_buffer, overwrite=True)
                     
                     print(f"  Uploaded: {blob_name} (ID: {content_version_id}) to {azure_blob_url}")
-                    record['AzureBlobUrl'] = azure_blob_url # Store the Azure Blob URL
+                    record['AzureBlobUrl'] = azure_blob_url
                     download_count += 1
+                    record['DownloadError'] = 'None' 
+
+                    # --- Add to SQL DB Update Batch ---
+                    db_update_batch.append((azure_blob_url, content_document_id))
+                    record['SqlUpdateStatus'] = 'Pending Batch Update'
+
+                    # --- Execute Batch Update if size reached ---
+                    if len(db_update_batch) >= db_batch_size:
+                        print(f"  Executing batch update for {len(db_update_batch)} records...")
+                        rows_affected = _execute_db_batch(cursor, cnxn, db_update_batch)
+                        if rows_affected >= 0: 
+                            sql_batch_update_count += rows_affected
+                            for r in processed_records: 
+                                if r.get('SqlUpdateStatus') == 'Pending Batch Update': 
+                                    r['SqlUpdateStatus'] = 'Success (Batched)'
+                        else: 
+                             for r in processed_records:
+                                if r.get('SqlUpdateStatus') == 'Pending Batch Update': 
+                                    r['SqlUpdateStatus'] = 'Failed (Batched)' 
+                        db_update_batch = [] 
+
                 except requests.exceptions.RequestException as req_e:
-                    print(f"  Error downloading {blob_name} (ID: {content_version_id}) from {full_download_url}: {req_e}")
+                    print(f"  ERROR downloading/uploading {blob_name} (ID: {content_version_id}): {req_e}")
                     record['DownloadError'] = str(req_e)
+                    record['SqlUpdateStatus'] = 'Not Attempted (Download Failed)'
                 except Exception as e:
-                    print(f"  An unexpected error occurred during upload of {blob_name} (ID: {content_version_id}) to Azure: {e}")
+                    print(f"  UNEXPECTED ERROR for {blob_name} (ID: {content_version_id}): {e}")
                     record['DownloadError'] = str(e)
+                    record['SqlUpdateStatus'] = 'Not Attempted (Processing Failed)'
             else:
-                record['DownloadError'] = "No VersionDataUrl"
+                reason = ""
+                if not version_data_url: reason += "No VersionDataUrl. "
+                if not content_document_id: reason += "No ContentDocumentId. "
+                record['DownloadError'] = f"Skipped: {reason.strip()}"
+                record['SqlUpdateStatus'] = 'Not Attempted (Missing Data)'
             
             processed_records.append(record)
 
+        # --- Execute any remaining batch updates after loop ---
+        if db_update_batch:
+            print(f"  Executing final batch update for {len(db_update_batch)} records...")
+            rows_affected = _execute_db_batch(cursor, cnxn, db_update_batch)
+            if rows_affected >= 0:
+                sql_batch_update_count += rows_affected
+                for r in processed_records: 
+                    if r.get('SqlUpdateStatus') == 'Pending Batch Update':
+                        r['SqlUpdateStatus'] = 'Success (Batched - Final)'
+            else:
+                for r in processed_records:
+                    if r.get('SqlUpdateStatus') == 'Pending Batch Update':
+                        r['SqlUpdateStatus'] = 'Failed (Batched - Final)'
+            
         if not processed_records:
             print("No ContentVersion records found since the last sync timestamp, or none processed.")
             return None
 
+        print(f"Summary:")
         print(f"Total ContentVersion metadata records processed: {record_count}")
         print(f"Total files uploaded to Azure Blob: {download_count}")
+        print(f"Total SQL DB records updated via batches: {sql_batch_update_count}")
 
-        # 7. Process the results (optional: convert to DataFrame)
         if 'pd' in globals():
             df = pd.DataFrame(processed_records)
             return df
         else:
             return processed_records
 
-    except (SalesforceError, ValueError, ClientAuthenticationError) as e:
-        print(f"An error occurred: {e}")
+    except (SalesforceError, ValueError, ClientAuthenticationError, pyodbc.Error) as e:
+        print(f"A critical error occurred: {e}")
         return None
     except Exception as e:
         print(f"An unexpected general error occurred: {e}")
         return None
     finally:
-        # Close the Salesforce session if it was opened
         if sf and hasattr(sf, 'session') and sf.session:
             try:
                 sf.close()
                 print("Salesforce session closed.")
             except Exception as e:
                 print(f"Error closing Salesforce session: {e}")
+        if cnxn:
+            try:
+                cnxn.close()
+                print("Azure SQL Database connection closed.")
+            except Exception as e:
+                print(f"Error closing Azure SQL Database connection: {e}")
 
-# --- Example Usage ----
+# --- Example Usage ---
 if __name__ == "__main__":
-    # Set these environment variables before running the script:
+    # --- Set your environment variables before running this script ---
+    # For Salesforce:
+    # export SF_USERNAME="your_salesforce_username"
+    # export SF_PASSWORD="your_salesforce_password"
+    # export SF_SECURITY_TOKEN="your_security_token"
+    
+    # For Azure Blob Storage:
     # export AZURE_STORAGE_ACCOUNT_NAME="your_storage_account_name"
     # export AZURE_STORAGE_CONTAINER_NAME="your_container_name"
-    # export AZURE_STORAGE_ACCOUNT_KEY="your_storage_account_key"
-    # OR export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=..."
+    # export AZURE_STORAGE_ACCOUNT_KEY="your_storage_account_key" # OR AZURE_STORAGE_CONNECTION_STRING
+    
+    # For Azure SQL Database:
+    # export AZURE_SQL_CONNECTION_STRING="DRIVER={ODBC Driver 17 for SQL Server};SERVER=yourserver.database.windows.net;DATABASE=yourdatabase;UID=yourusername;PWD=yourpassword"
+    # export AZURE_DB_BATCH_SIZE="50" # Optional, defaults to 50
 
-    SF_USERNAME = os.environ.get('SF_USERNAME', 'your_salesforce_username')
-    SF_PASSWORD = os.environ.get('SF_PASSWORD', 'your_salesforce_password')
-    SF_SECURITY_TOKEN = os.environ.get('SF_SECURITY_TOKEN', 'your_security_token')
+    SF_USERNAME = os.environ.get('SF_USERNAME')
+    SF_PASSWORD = os.environ.get('SF_PASSWORD')
+    SF_SECURITY_TOKEN = os.environ.get('SF_SECURITY_TOKEN')
     
-    LAST_SYNC_TIMESTAMP = '2025-06-15T00:00:00Z' # Adjust as needed
-    
+    LAST_SYNC_TIMESTAMP = '2025-01-01T00:00:00Z' 
     IS_SANDBOX = False 
 
-    print(f"Attempting to download ContentVersion records and upload files to Azure Blob Storage, modified after: {LAST_SYNC_TIMESTAMP}")
+    print(f"Starting process to download ContentVersion, upload to Azure Blob, and update Azure SQL DB in batches, for records modified after: {LAST_SYNC_TIMESTAMP}")
     
-    content_versions_uploaded = download_content_versions_and_files_to_azure_blob(
+    results = download_content_versions_and_files_to_azure_blob_and_sql_batched(
         SF_USERNAME, 
         SF_PASSWORD, 
         SF_SECURITY_TOKEN, 
@@ -236,17 +346,17 @@ if __name__ == "__main__":
         sandbox=IS_SANDBOX
     )
 
-    if content_versions_uploaded is not None:
-        if isinstance(content_versions_uploaded, pd.DataFrame):
-            print("\nProcessed ContentVersion Data with Azure Blob URLs (first 5 rows):")
-            print(content_versions_uploaded[['Id', 'Title', 'FileExtension', 'AzureBlobUrl', 'DownloadError']].head())
-            print(f"\nTotal records processed: {len(content_versions_uploaded)}")
+    if results is not None:
+        if isinstance(results, pd.DataFrame):
+            print("\nFinal Processed Data (first 5 rows):")
+            print(results[['Id', 'Title', 'FileExtension', 'AzureBlobUrl', 'SqlUpdateStatus', 'DownloadError']].head())
+            print(f"\nTotal records processed by script: {len(results)}")
         else:
-            print("\nProcessed ContentVersion Data (first record with Azure Blob URL):")
-            if content_versions_uploaded:
-                print(content_versions_uploaded[0])
+            print("\nFinal Processed Data (first record with status):")
+            if results:
+                print(results[0])
             else:
                 print("No records to display.")
-            print(f"\nTotal records processed: {len(content_versions_uploaded)}")
+            print(f"\nTotal records processed by script: {len(results)}")
     else:
-        print("Failed to download ContentVersion records or upload files to Azure Blob Storage.")
+        print("Script terminated due to a critical error.")
