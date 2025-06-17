@@ -10,6 +10,23 @@
                 "port": 9091
             },
             "preLaunchTask": "func: host start"
+        },
+        {
+            "name": "Python: Azure Function",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/code_to_import.py",
+            "env": {
+                "AZURE_STORAGE_ACCOUNT_NAME": "lendzpartnershare",
+                "AZURE_STORAGE_CONTAINER_NAME": "lendz-loan-documents",
+                "AZURE_STORAGE_ACCOUNT_KEY": "vDECnV3cOdTMbd6F6PCVXcPK6mc/JBMIqWFiJXdnbcmXR3bBzvpus+GXiikA+d6Ygf5dUGTYAmpC+AStc+bPaA==",
+                // OR use the connection string instead
+                // "AZURE_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=lendzpartnershare;AccountKey=vDECnV3cOdTMbd6F6PCVXcPK6mc/JBMIqWFiJXdnbcmXR3bBzvpus+GXiikA+d6Ygf5dUGTYAmpC+AStc+bPaA==;EndpointSuffix=core.windows.net",
+                "SF_USERNAME": "danny.tekumalla@lendzfinancial.com",
+                "SF_PASSWORD": "KKr@Aug06!996",
+                "SF_SECURITY_TOKEN": "yIMQuZzUFNz6NFOQKJA1ua0f"
+            },
+            "console": "integratedTerminal"
         }
     ]
 }
