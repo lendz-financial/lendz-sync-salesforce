@@ -10,6 +10,7 @@ import requests
 import pyodbc
 from simple_salesforce import Salesforce, SalesforceError
 import pandas as pd
+import datetime 
 
 # Azure Blob Storage imports
 from azure.storage.blob import BlobServiceClient
@@ -18,22 +19,19 @@ from azure.core.exceptions import ResourceNotFoundError, ClientAuthenticationErr
 def _execute_db_batch(cursor, cnxn, batch_data):
     """
     Executes a batch update for Azure SQL Database.
-    batch_data is a list of tuples: [(azure_blob_url, content_document_id), ...]
+    batch_data is a list of tuples: [(azure_blob_url, content_document_id, system_modstamp, content_version_id), ...]
+    Returns the number of rows affected or -1 on failure.
     """
     if not batch_data:
-        return 0 # No data to update
+        return 0 
 
-    # Construct the VALUES clause dynamically
-    # Each item in VALUES will be (?, ?) for (AzureBlobUrl, ContentDocumentId)
-    values_placeholders = ', '.join(['(?, ?)' for _ in batch_data])
+    values_placeholders = ', '.join(['(?, ?)' for _ in batch_data]) 
     
-    # Flatten the parameters list for pyodbc
     flat_params = []
-    for url, doc_id in batch_data:
+    for url, doc_id, _, _ in batch_data: # Ignore system_modstamp and content_version_id here
         flat_params.append(url)
         flat_params.append(doc_id)
 
-    # SQL UPDATE statement using a VALUES clause for multiple rows
     update_sql = f"""
     UPDATE T
     SET T.AzureBlobUrl = V.AzureBlobUrl
@@ -43,13 +41,42 @@ def _execute_db_batch(cursor, cnxn, batch_data):
     """
     
     try:
-        cursor.execute(update_sql, *flat_params) # Unpack flat_params for cursor.execute
+        cursor.execute(update_sql, *flat_params) 
         cnxn.commit()
-        return cursor.rowcount # Number of rows affected
+        return cursor.rowcount 
     except pyodbc.Error as sql_err:
         cnxn.rollback()
         print(f"  ERROR executing batch SQL DB update: {sql_err}")
-        return -1 # Indicate failure
+        return -1 
+
+def _update_sync_state(cursor, cnxn, state_name, last_record_id, last_system_modstamp):
+    """
+    Updates the SyncState table with the latest processed record information.
+    Uses MERGE for an UPSERT operation.
+    last_record_id is now a generic placeholder for the ID of any Salesforce object.
+    """
+    sync_state_sql = """
+    MERGE [dbo].[SyncState] AS T
+    USING (SELECT ? AS StateName, ? AS LastRecordId, ? AS LastSystemModstamp) AS S
+    ON T.StateName = S.StateName
+    WHEN MATCHED THEN
+        UPDATE SET
+            T.LastRecordId = S.LastRecordId,
+            T.LastSystemModstamp = S.LastSystemModstamp,
+            T.LastUpdatedDateTime = SYSDATETIMEOFFSET()
+    WHEN NOT MATCHED THEN
+        INSERT (StateName, LastRecordId, LastSystemModstamp)
+        VALUES (S.StateName, S.LastRecordId, S.LastSystemModstamp);
+    """
+    try:
+        cursor.execute(sync_state_sql, state_name, last_record_id, last_system_modstamp)
+        cnxn.commit()
+        print(f"  SyncState updated for '{state_name}' to Record ID: {last_record_id}, Modstamp: {last_system_modstamp}")
+        return True
+    except pyodbc.Error as sql_err:
+        cnxn.rollback()
+        print(f"  ERROR updating SyncState for '{state_name}': {sql_err}")
+        return False
 
 
 def download_content_versions_and_files_to_azure_blob_and_sql_batched(
@@ -59,6 +86,7 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
     """
     Downloads ContentVersion objects from Salesforce using Bulk API 2.0,
     uploads files to Azure Blob Storage, and updates Azure SQL Database in batches.
+    Also updates a SyncState table with the last processed record's SystemModstamp.
 
     Required Environment Variables:
     - SF_USERNAME, SF_PASSWORD, SF_SECURITY_TOKEN (for Salesforce)
@@ -87,13 +115,12 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
 
     try:
         # --- Read Batch Size from Environment Variable ---
-        db_batch_size_str = os.environ.get('AZURE_DB_BATCH_SIZE', '50') # Default to 50
+        db_batch_size_str = os.environ.get('AZURE_DB_BATCH_SIZE', '50') 
         try:
             db_batch_size = int(db_batch_size_str)
             if db_batch_size <= 0:
                 raise ValueError("Batch size must be a positive integer.")
         except ValueError as e:
-            # Fallback to default if environment variable is invalid
             print(f"Warning: Invalid AZURE_DB_BATCH_SIZE environment variable '{db_batch_size_str}'. Defaulting to 50. Error: {e}")
             db_batch_size = 50 
 
@@ -110,7 +137,7 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
         azure_storage_account_name = os.environ.get('AZURE_STORAGE_ACCOUNT_NAME')
         azure_storage_container_name = os.environ.get('AZURE_STORAGE_CONTAINER_NAME')
         azure_storage_account_key = os.environ.get('AZURE_STORAGE_ACCOUNT_KEY')
-        azure_storage_connection_string_blob = os.environ.get('AZURE_STORAGE_CONNECTION_STRING') # Renamed to avoid conflict
+        azure_storage_connection_string_blob = os.environ.get('AZURE_STORAGE_CONNECTION_STRING') 
 
         if not azure_storage_account_name or not azure_storage_container_name:
             raise ValueError(
@@ -172,6 +199,7 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
 
         session_id = sf.session_id
         processed_records = []
+        # db_update_batch now stores (url, doc_id, system_modstamp, content_version_id) tuples
         db_update_batch = [] 
         
         download_count = 0
@@ -184,14 +212,16 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
             version_data_url = record.get('VersionDataUrl')
             file_extension = record.get('FileExtension')
             title = record.get('Title')
-            content_version_id = record.get('Id')
+            content_version_id = record.get('Id') # This is the ContentVersion.Id
             content_document_id = record.get('ContentDocumentId')
+            system_modstamp = record.get('SystemModstamp') 
 
             record['AzureBlobUrl'] = None
             record['DownloadError'] = None
             record['SqlUpdateStatus'] = 'Skipped' 
+            record['LastSystemModstampInBatch'] = None 
 
-            if version_data_url and content_document_id:
+            if version_data_url and content_document_id and system_modstamp: 
                 full_download_url = version_data_url 
                 
                 safe_title = "".join([c for c in (title or content_version_id) if c.isalnum() or c in (' ', '.', '_', '-')]).strip()
@@ -228,18 +258,44 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
                     record['DownloadError'] = 'None' 
 
                     # --- Add to SQL DB Update Batch ---
-                    db_update_batch.append((azure_blob_url, content_document_id))
+                    # Store ContentVersion.Id as the record ID for sync state
+                    db_update_batch.append((azure_blob_url, content_document_id, system_modstamp, content_version_id)) 
                     record['SqlUpdateStatus'] = 'Pending Batch Update'
 
                     # --- Execute Batch Update if size reached ---
                     if len(db_update_batch) >= db_batch_size:
                         print(f"  Executing batch update for {len(db_update_batch)} records...")
                         rows_affected = _execute_db_batch(cursor, cnxn, db_update_batch)
-                        if rows_affected >= 0: 
+                        
+                        if rows_affected >= 0: # ContentVersion batch update successful
                             sql_batch_update_count += rows_affected
+                            
+                            max_modstamp_in_batch = None
+                            last_record_id_in_batch = None # Changed variable name
+                            
+                            for batch_item in db_update_batch:
+                                # batch_item is (azure_blob_url, content_document_id, system_modstamp_str, content_version_id)
+                                current_modstamp_str = batch_item[2]
+                                current_record_id = batch_item[3] # Changed variable name
+
+                                if max_modstamp_in_batch is None:
+                                    max_modstamp_in_batch = datetime.datetime.fromisoformat(current_modstamp_str.replace('Z', '+00:00'))
+                                    last_record_id_in_batch = current_record_id
+                                else:
+                                    compare_modstamp = datetime.datetime.fromisoformat(current_modstamp_str.replace('Z', '+00:00'))
+                                    if compare_modstamp > max_modstamp_in_batch:
+                                        max_modstamp_in_batch = compare_modstamp
+                                        last_record_id_in_batch = current_record_id
+
+                            # Update SyncState table with the progress
+                            _update_sync_state(cursor, cnxn, 'ContentVersionSync', 
+                                               last_record_id_in_batch, # Pass generic record ID
+                                               max_modstamp_in_batch.isoformat(timespec='milliseconds').replace('+00:00', 'Z')) 
+
                             for r in processed_records: 
                                 if r.get('SqlUpdateStatus') == 'Pending Batch Update': 
                                     r['SqlUpdateStatus'] = 'Success (Batched)'
+                                    r['LastSystemModstampInBatch'] = max_modstamp_in_batch.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
                         else: 
                              for r in processed_records:
                                 if r.get('SqlUpdateStatus') == 'Pending Batch Update': 
@@ -258,6 +314,7 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
                 reason = ""
                 if not version_data_url: reason += "No VersionDataUrl. "
                 if not content_document_id: reason += "No ContentDocumentId. "
+                if not system_modstamp: reason += "No SystemModstamp. "
                 record['DownloadError'] = f"Skipped: {reason.strip()}"
                 record['SqlUpdateStatus'] = 'Not Attempted (Missing Data)'
             
@@ -267,11 +324,34 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
         if db_update_batch:
             print(f"  Executing final batch update for {len(db_update_batch)} records...")
             rows_affected = _execute_db_batch(cursor, cnxn, db_update_batch)
-            if rows_affected >= 0:
+            
+            if rows_affected >= 0: 
                 sql_batch_update_count += rows_affected
+                
+                max_modstamp_in_batch = None
+                last_record_id_in_batch = None # Changed variable name
+                for batch_item in db_update_batch:
+                    current_modstamp_str = batch_item[2]
+                    current_record_id = batch_item[3] # Changed variable name
+
+                    if max_modstamp_in_batch is None:
+                        max_modstamp_in_batch = datetime.datetime.fromisoformat(current_modstamp_str.replace('Z', '+00:00'))
+                        last_record_id_in_batch = current_record_id
+                    else:
+                        compare_modstamp = datetime.datetime.fromisoformat(current_modstamp_str.replace('Z', '+00:00'))
+                        if compare_modstamp > max_modstamp_in_batch:
+                            max_modstamp_in_batch = compare_modstamp
+                            last_record_id_in_batch = current_record_id
+
+                # Update SyncState table with the progress
+                _update_sync_state(cursor, cnxn, 'ContentVersionSync', 
+                                   last_record_id_in_batch, # Pass generic record ID
+                                   max_modstamp_in_batch.isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
+
                 for r in processed_records: 
                     if r.get('SqlUpdateStatus') == 'Pending Batch Update':
                         r['SqlUpdateStatus'] = 'Success (Batched - Final)'
+                        r['LastSystemModstampInBatch'] = max_modstamp_in_batch.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
             else:
                 for r in processed_records:
                     if r.get('SqlUpdateStatus') == 'Pending Batch Update':
@@ -323,7 +403,7 @@ if __name__ == "__main__":
     # For Azure Blob Storage:
     # export AZURE_STORAGE_ACCOUNT_NAME="your_storage_account_name"
     # export AZURE_STORAGE_CONTAINER_NAME="your_container_name"
-    # export AZURE_STORAGE_ACCOUNT_KEY="your_storage_account_key" # OR AZURE_STORAGE_CONNECTION_STRING
+    # export AZURE_STORAGE_ACCOUNT_KEY="your_storage_account_key" # OR AZURE_STORAGE_CONNECTION_STRING (for Blob)
     
     # For Azure SQL Database:
     # export AZURE_SQL_CONNECTION_STRING="DRIVER={ODBC Driver 17 for SQL Server};SERVER=yourserver.database.windows.net;DATABASE=yourdatabase;UID=yourusername;PWD=yourpassword"
@@ -333,7 +413,10 @@ if __name__ == "__main__":
     SF_PASSWORD = os.environ.get('SF_PASSWORD')
     SF_SECURITY_TOKEN = os.environ.get('SF_SECURITY_TOKEN')
     
-    LAST_SYNC_TIMESTAMP = '2025-01-01T00:00:00Z' 
+    # IMPORTANT: In a real scenario, you would fetch this from the SyncState table
+    # Example: query SyncState table for 'ContentVersionSync' and get LastSystemModstamp
+    # If not found or NULL, use a default start date.
+    LAST_SYNC_TIMESTAMP = '2024-01-01T00:00:00Z' 
     IS_SANDBOX = False 
 
     print(f"Starting process to download ContentVersion, upload to Azure Blob, and update Azure SQL DB in batches, for records modified after: {LAST_SYNC_TIMESTAMP}")
@@ -349,7 +432,7 @@ if __name__ == "__main__":
     if results is not None:
         if isinstance(results, pd.DataFrame):
             print("\nFinal Processed Data (first 5 rows):")
-            print(results[['Id', 'Title', 'FileExtension', 'AzureBlobUrl', 'SqlUpdateStatus', 'DownloadError']].head())
+            print(results[['Id', 'Title', 'FileExtension', 'AzureBlobUrl', 'SqlUpdateStatus', 'LastSystemModstampInBatch', 'DownloadError']].head())
             print(f"\nTotal records processed by script: {len(results)}")
         else:
             print("\nFinal Processed Data (first record with status):")
