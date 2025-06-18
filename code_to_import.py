@@ -3,14 +3,14 @@ import logging
 def helper_code() -> None:
     logging.info("Helper code function successfully executed. AB")
     
+
 import csv
 from io import StringIO, BytesIO
 import os
 import requests
 import pyodbc
 from simple_salesforce import Salesforce, SalesforceError
-import pandas as pd
-import datetime 
+from datetime import datetime, timezone, timedelta # Updated import
 
 # Azure Blob Storage imports
 from azure.storage.blob import BlobServiceClient
@@ -28,7 +28,7 @@ def _execute_db_batch(cursor, cnxn, batch_data):
     values_placeholders = ', '.join(['(?, ?)' for _ in batch_data]) 
     
     flat_params = []
-    for url, doc_id, _, _ in batch_data: # Ignore system_modstamp and content_version_id here
+    for url, doc_id, _, _ in batch_data: 
         flat_params.append(url)
         flat_params.append(doc_id)
 
@@ -54,6 +54,7 @@ def _update_sync_state(cursor, cnxn, state_name, last_record_id, last_system_mod
     Updates the SyncState table with the latest processed record information.
     Uses MERGE for an UPSERT operation.
     last_record_id is now a generic placeholder for the ID of any Salesforce object.
+    last_system_modstamp should be in Salesforce's Besançon-MM-DDTHH:MM:SS.sssZ format.
     """
     sync_state_sql = """
     MERGE [dbo].[SyncState] AS T
@@ -78,15 +79,51 @@ def _update_sync_state(cursor, cnxn, state_name, last_record_id, last_system_mod
         print(f"  ERROR updating SyncState for '{state_name}': {sql_err}")
         return False
 
+def _get_last_sync_timestamp_from_db(cursor, state_name):
+    """
+    Retrieves the LastSystemModstamp for a given state_name from the SyncState table.
+    It converts the stored DATETIMEOFFSET to UTC DATETIME.
+    Returns the timestamp in Salesforce's Besançon-MM-DDTHH:MM:SS.sssZ format, or None if not found.
+    """
+    # SQL query applying Option 1: Convert LastSystemModstamp to UTC DATETIME
+    select_sql = """
+    SELECT
+        CAST(LastSystemModstamp AT TIME ZONE 'UTC' AS DATETIME) AS LastSystemModstampUtcDateTime
+    FROM
+        [dbo].[SyncState]
+    WHERE
+        StateName = ?
+    """
+    try:
+        cursor.execute(select_sql, state_name)
+        result = cursor.fetchone()
+        if result and result[0]:
+            dt_object = result[0]
+            # Convert datetime object (which is now guaranteed to be UTC from the SQL query)
+            # back to Salesforce's expected string format (ISO 8601 with 'Z' for UTC)
+            # Ensure proper ISO format for timezone-aware or naive UTC datetime
+            if dt_object.tzinfo is not None and dt_object.tzinfo.utcoffset(dt_object) == timedelta(0):
+                 # If it's a timezone-aware UTC datetime (e.g., from datetime.fromisoformat with +00:00)
+                return dt_object.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+            else:
+                # If it's a naive datetime (typical for CAST AS DATETIME), assume it's UTC and append 'Z'
+                return dt_object.isoformat(timespec='milliseconds') + 'Z'
+        else:
+            print(f"  No existing sync state found for '{state_name}' in SyncState table.")
+            return None
+    except pyodbc.Error as sql_err:
+        print(f"  ERROR retrieving last sync timestamp for '{state_name}': {sql_err}")
+        return None
+
 
 def download_content_versions_and_files_to_azure_blob_and_sql_batched(
-    username, password, security_token, last_sync_timestamp, 
+    username, password, security_token, initial_last_sync_timestamp, 
     sandbox=False
 ):
     """
     Downloads ContentVersion objects from Salesforce using Bulk API 2.0,
     uploads files to Azure Blob Storage, and updates Azure SQL Database in batches.
-    Also updates a SyncState table with the last processed record's SystemModstamp.
+    Starts download from the LastSystemModstamp recorded in SyncState table.
 
     Required Environment Variables:
     - SF_USERNAME, SF_PASSWORD, SF_SECURITY_TOKEN (for Salesforce)
@@ -98,16 +135,15 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
         username (str): Salesforce username.
         password (str): Salesforce password.
         security_token (str): Salesforce security token.
-        last_sync_timestamp (str): Timestamp string (e.g., '2024-01-01T00:00:00Z')
-                                   to filter records by SystemModstamp greater than this.
+        initial_last_sync_timestamp (str): Fallback timestamp string (e.g., '2024-01-01T00:00:00Z')
+                                           to use if no state is found in the database.
         sandbox (bool, optional): Set to True if connecting to a sandbox environment.
                                   Defaults to False (production).
 
     Returns:
-        pandas.DataFrame or list: A Pandas DataFrame containing the processed records
-                                  (including Azure Blob URL and SQL update status),
-                                  if pandas is installed, otherwise a list of dictionaries.
-                                  Returns None if a critical error occurs.
+        list: A list of dictionaries containing the processed records
+              (including Azure Blob URL and SQL update status).
+              Returns None if a critical error occurs.
     """
     sf = None
     container_client = None
@@ -115,7 +151,7 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
 
     try:
         # --- Read Batch Size from Environment Variable ---
-        db_batch_size_str = os.environ.get('AZURE_DB_BATCH_SIZE', '50') 
+        db_batch_size_str = os.environ.get('AZURE_DB_BATCH_SIZE', '5') 
         try:
             db_batch_size = int(db_batch_size_str)
             if db_batch_size <= 0:
@@ -179,6 +215,13 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
         cursor = cnxn.cursor()
         print("Successfully connected to Azure SQL Database.")
 
+        # --- Determine the actual start timestamp for the SOQL query ---
+        db_last_sync_timestamp = _get_last_sync_timestamp_from_db(cursor, 'ContentVersionSync')
+        
+        soql_start_timestamp = db_last_sync_timestamp if db_last_sync_timestamp else initial_last_sync_timestamp
+        print(f"Starting Salesforce query from SystemModstamp: {soql_start_timestamp}")
+
+
         # --- Salesforce SOQL Query ---
         soql_query = (
             f"SELECT Id, ContentDocumentId, IsLatest, ContentUrl, ContentBodyId, "
@@ -190,7 +233,7 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
             f"ContentSize, FileExtension, FirstPublishLocationId, Origin, NetworkId, "
             f"ContentLocation, TextPreview, ExternalDocumentInfo1, ExternalDocumentInfo2, "
             f"Checksum, IsMajorVersion, IsAssetEnabled, VersionDataUrl "
-            f"FROM ContentVersion WHERE SystemModstamp > {last_sync_timestamp}"
+            f"FROM ContentVersion WHERE SystemModstamp > {soql_start_timestamp}" 
         )
         print(f"Executing SOQL query: {soql_query}")
 
@@ -199,7 +242,6 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
 
         session_id = sf.session_id
         processed_records = []
-        # db_update_batch now stores (url, doc_id, system_modstamp, content_version_id) tuples
         db_update_batch = [] 
         
         download_count = 0
@@ -212,16 +254,16 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
             version_data_url = record.get('VersionDataUrl')
             file_extension = record.get('FileExtension')
             title = record.get('Title')
-            content_version_id = record.get('Id') # This is the ContentVersion.Id
+            content_version_id = record.get('Id') 
             content_document_id = record.get('ContentDocumentId')
-            system_modstamp = record.get('SystemModstamp') 
+            system_modstamp = record.get('SystemModstamp') # This is the incoming long millisecond timestamp
 
             record['AzureBlobUrl'] = None
             record['DownloadError'] = None
             record['SqlUpdateStatus'] = 'Skipped' 
             record['LastSystemModstampInBatch'] = None 
 
-            if version_data_url and content_document_id and system_modstamp: 
+            if version_data_url and content_document_id and system_modstamp is not None: # Check for None explicitly
                 full_download_url = version_data_url 
                 
                 safe_title = "".join([c for c in (title or content_version_id) if c.isalnum() or c in (' ', '.', '_', '-')]).strip()
@@ -258,7 +300,9 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
                     record['DownloadError'] = 'None' 
 
                     # --- Add to SQL DB Update Batch ---
-                    # Store ContentVersion.Id as the record ID for sync state
+                    # system_modstamp (from record.get) is the millisecond timestamp here
+                    # We store it in db_update_batch as is for now, it's converted to ISO string later
+                    # for the DB update itself.
                     db_update_batch.append((azure_blob_url, content_document_id, system_modstamp, content_version_id)) 
                     record['SqlUpdateStatus'] = 'Pending Batch Update'
 
@@ -267,36 +311,47 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
                         print(f"  Executing batch update for {len(db_update_batch)} records...")
                         rows_affected = _execute_db_batch(cursor, cnxn, db_update_batch)
                         
-                        if rows_affected >= 0: # ContentVersion batch update successful
+                        if rows_affected >= 0: 
                             sql_batch_update_count += rows_affected
                             
                             max_modstamp_in_batch = None
-                            last_record_id_in_batch = None # Changed variable name
+                            last_record_id_in_batch = None 
                             
                             for batch_item in db_update_batch:
-                                # batch_item is (azure_blob_url, content_document_id, system_modstamp_str, content_version_id)
-                                current_modstamp_str = batch_item[2]
-                                current_record_id = batch_item[3] # Changed variable name
+                                current_modstamp_ms = batch_item[2] # This is now the long millisecond timestamp
+                                current_record_id = batch_item[3]
 
-                                if max_modstamp_in_batch is None:
-                                    max_modstamp_in_batch = datetime.datetime.fromisoformat(current_modstamp_str.replace('Z', '+00:00'))
+                                # Convert milliseconds since epoch to UTC datetime object
+                                try:
+                                    current_modstamp_dt = datetime.fromtimestamp(float(current_modstamp_ms) / 1000, tz=timezone.utc)
+                                except (TypeError, ValueError) as e:
+                                    print(f"  WARNING: Could not parse SystemModstamp '{current_modstamp_ms}' for record {current_record_id}. Error: {e}")
+                                    continue # Skip this item for timestamp comparison, but still process others in batch
+
+                                if max_modstamp_in_batch is None or current_modstamp_dt > max_modstamp_in_batch:
+                                    max_modstamp_in_batch = current_modstamp_dt
                                     last_record_id_in_batch = current_record_id
-                                else:
-                                    compare_modstamp = datetime.datetime.fromisoformat(current_modstamp_str.replace('Z', '+00:00'))
-                                    if compare_modstamp > max_modstamp_in_batch:
-                                        max_modstamp_in_batch = compare_modstamp
-                                        last_record_id_in_batch = current_record_id
 
-                            # Update SyncState table with the progress
-                            _update_sync_state(cursor, cnxn, 'ContentVersionSync', 
-                                               last_record_id_in_batch, # Pass generic record ID
-                                               max_modstamp_in_batch.isoformat(timespec='milliseconds').replace('+00:00', 'Z')) 
+                            # Only update sync state if a valid max timestamp was found in the batch
+                            if max_modstamp_in_batch:
+                                # Convert Python datetime object back to Salesforce's expected string format for DB storage
+                                max_modstamp_sf_format = max_modstamp_in_batch.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
-                            for r in processed_records: 
-                                if r.get('SqlUpdateStatus') == 'Pending Batch Update': 
-                                    r['SqlUpdateStatus'] = 'Success (Batched)'
-                                    r['LastSystemModstampInBatch'] = max_modstamp_in_batch.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-                        else: 
+                                _update_sync_state(cursor, cnxn, 'ContentVersionSync', 
+                                                   last_record_id_in_batch, 
+                                                   max_modstamp_sf_format) 
+
+                                for r in processed_records: 
+                                    if r.get('SqlUpdateStatus') == 'Pending Batch Update': 
+                                        r['SqlUpdateStatus'] = 'Success (Batched)'
+                                        r['LastSystemModstampInBatch'] = max_modstamp_sf_format
+                            else:
+                                print(f"  WARNING: No valid SystemModstamp found in batch for sync state update.")
+                                for r in processed_records:
+                                    if r.get('SqlUpdateStatus') == 'Pending Batch Update':
+                                        r['SqlUpdateStatus'] = 'Skipped (No valid timestamp in batch)'
+
+                        else: # rows_affected < 0, indicating DB error
                              for r in processed_records:
                                 if r.get('SqlUpdateStatus') == 'Pending Batch Update': 
                                     r['SqlUpdateStatus'] = 'Failed (Batched)' 
@@ -314,7 +369,7 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
                 reason = ""
                 if not version_data_url: reason += "No VersionDataUrl. "
                 if not content_document_id: reason += "No ContentDocumentId. "
-                if not system_modstamp: reason += "No SystemModstamp. "
+                if system_modstamp is None: reason += "No SystemModstamp. "
                 record['DownloadError'] = f"Skipped: {reason.strip()}"
                 record['SqlUpdateStatus'] = 'Not Attempted (Missing Data)'
             
@@ -329,36 +384,47 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
                 sql_batch_update_count += rows_affected
                 
                 max_modstamp_in_batch = None
-                last_record_id_in_batch = None # Changed variable name
+                last_record_id_in_batch = None 
                 for batch_item in db_update_batch:
-                    current_modstamp_str = batch_item[2]
-                    current_record_id = batch_item[3] # Changed variable name
+                    current_modstamp_ms = batch_item[2] # This is now the long millisecond timestamp
+                    current_record_id = batch_item[3]
 
-                    if max_modstamp_in_batch is None:
-                        max_modstamp_in_batch = datetime.datetime.fromisoformat(current_modstamp_str.replace('Z', '+00:00'))
+                    # Convert milliseconds since epoch to UTC datetime object
+                    try:
+                        current_modstamp_dt = datetime.fromtimestamp(float(current_modstamp_ms) / 1000, tz=timezone.utc)
+                    except (TypeError, ValueError) as e:
+                        print(f"  WARNING: Could not parse SystemModstamp '{current_modstamp_ms}' for record {current_record_id}. Error: {e}")
+                        continue # Skip this item for timestamp comparison, but still process others in batch
+
+                    if max_modstamp_in_batch is None or current_modstamp_dt > max_modstamp_in_batch:
+                        max_modstamp_in_batch = current_modstamp_dt
                         last_record_id_in_batch = current_record_id
-                    else:
-                        compare_modstamp = datetime.datetime.fromisoformat(current_modstamp_str.replace('Z', '+00:00'))
-                        if compare_modstamp > max_modstamp_in_batch:
-                            max_modstamp_in_batch = compare_modstamp
-                            last_record_id_in_batch = current_record_id
 
-                # Update SyncState table with the progress
-                _update_sync_state(cursor, cnxn, 'ContentVersionSync', 
-                                   last_record_id_in_batch, # Pass generic record ID
-                                   max_modstamp_in_batch.isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
+                # Only update sync state if a valid max timestamp was found in the batch
+                if max_modstamp_in_batch:
+                    max_modstamp_sf_format = max_modstamp_in_batch.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
-                for r in processed_records: 
-                    if r.get('SqlUpdateStatus') == 'Pending Batch Update':
-                        r['SqlUpdateStatus'] = 'Success (Batched - Final)'
-                        r['LastSystemModstampInBatch'] = max_modstamp_in_batch.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-            else:
+                    _update_sync_state(cursor, cnxn, 'ContentVersionSync', 
+                                       last_record_id_in_batch, 
+                                       max_modstamp_sf_format)
+
+                    for r in processed_records: 
+                        if r.get('SqlUpdateStatus') == 'Pending Batch Update':
+                            r['SqlUpdateStatus'] = 'Success (Batched - Final)'
+                            r['LastSystemModstampInBatch'] = max_modstamp_sf_format
+                else:
+                    print(f"  WARNING: No valid SystemModstamp found in final batch for sync state update.")
+                    for r in processed_records:
+                        if r.get('SqlUpdateStatus') == 'Pending Batch Update':
+                            r['SqlUpdateStatus'] = 'Skipped (No valid timestamp in final batch)'
+
+            else: # rows_affected < 0, indicating DB error
                 for r in processed_records:
                     if r.get('SqlUpdateStatus') == 'Pending Batch Update':
                         r['SqlUpdateStatus'] = 'Failed (Batched - Final)'
             
         if not processed_records:
-            print("No ContentVersion records found since the last sync timestamp, or none processed.")
+            print(f"No ContentVersion records found since the last sync timestamp ({soql_start_timestamp}), or none processed.")
             return None
 
         print(f"Summary:")
@@ -366,11 +432,7 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
         print(f"Total files uploaded to Azure Blob: {download_count}")
         print(f"Total SQL DB records updated via batches: {sql_batch_update_count}")
 
-        if 'pd' in globals():
-            df = pd.DataFrame(processed_records)
-            return df
-        else:
-            return processed_records
+        return processed_records
 
     except (SalesforceError, ValueError, ClientAuthenticationError, pyodbc.Error) as e:
         print(f"A critical error occurred: {e}")
@@ -413,33 +475,36 @@ if __name__ == "__main__":
     SF_PASSWORD = os.environ.get('SF_PASSWORD')
     SF_SECURITY_TOKEN = os.environ.get('SF_SECURITY_TOKEN')
     
-    # IMPORTANT: In a real scenario, you would fetch this from the SyncState table
-    # Example: query SyncState table for 'ContentVersionSync' and get LastSystemModstamp
-    # If not found or NULL, use a default start date.
-    LAST_SYNC_TIMESTAMP = '2024-01-01T00:00:00Z' 
+    # Initial timestamp MUST be in Salesforce ISO 8601 format (e.g., '2024-01-01T00:00:00Z')
+    # because the SOQL query 'WHERE SystemModstamp > {soql_start_timestamp}' expects it.
+    INITIAL_LAST_SYNC_TIMESTAMP = '2024-01-01T00:00:00Z' 
     IS_SANDBOX = False 
 
-    print(f"Starting process to download ContentVersion, upload to Azure Blob, and update Azure SQL DB in batches, for records modified after: {LAST_SYNC_TIMESTAMP}")
+    print(f"Starting ContentVersion sync process.")
     
     results = download_content_versions_and_files_to_azure_blob_and_sql_batched(
         SF_USERNAME, 
         SF_PASSWORD, 
         SF_SECURITY_TOKEN, 
-        LAST_SYNC_TIMESTAMP, 
+        INITIAL_LAST_SYNC_TIMESTAMP, 
         sandbox=IS_SANDBOX
     )
 
     if results is not None:
-        if isinstance(results, pd.DataFrame):
-            print("\nFinal Processed Data (first 5 rows):")
-            print(results[['Id', 'Title', 'FileExtension', 'AzureBlobUrl', 'SqlUpdateStatus', 'LastSystemModstampInBatch', 'DownloadError']].head())
-            print(f"\nTotal records processed by script: {len(results)}")
+        print("\nFinal Processed Data (first 5 records):")
+        if results:
+            for i, record in enumerate(results[:5]):
+                print(f"Record {i+1}:")
+                print(f"  Id: {record.get('Id')}")
+                print(f"  Title: {record.get('Title')}")
+                print(f"  FileExtension: {record.get('FileExtension')}")
+                print(f"  AzureBlobUrl: {record.get('AzureBlobUrl')}")
+                print(f"  SqlUpdateStatus: {record.get('SqlUpdateStatus')}")
+                print(f"  LastSystemModstampInBatch: {record.get('LastSystemModstampInBatch')}")
+                print(f"  DownloadError: {record.get('DownloadError')}")
+                print("-" * 20)
         else:
-            print("\nFinal Processed Data (first record with status):")
-            if results:
-                print(results[0])
-            else:
-                print("No records to display.")
-            print(f"\nTotal records processed by script: {len(results)}")
+            print("No records to display.")
+        print(f"\nTotal records processed by script: {len(results)}")
     else:
         print("Script terminated due to a critical error.")

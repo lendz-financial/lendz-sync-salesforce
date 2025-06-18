@@ -121,3 +121,18 @@ WHEN NOT MATCHED BY TARGET THEN
     INSERT (StateName, LastRecordId, LastSystemModstamp)
     VALUES (S.StateName, S.LastId, S.LastStamp);
 GO
+
+-- SQL to update the SyncState for 'ContentVersionSync' to June 15th, 2025, 4:00:00 AM UTC.
+-- This MERGE statement will UPDATE the row if 'ContentVersionSync' exists,
+-- or INSERT it if it does not exist.
+
+MERGE INTO [dbo].[SyncState] AS T
+USING (SELECT 'ContentVersionSync' AS StateName, '2025-06-15T04:00:00.000Z' AS TargetModstamp) AS S
+ON T.StateName = S.StateName
+WHEN MATCHED THEN
+    UPDATE SET
+        T.LastSystemModstamp = S.TargetModstamp,
+        T.LastUpdatedDateTime = SYSDATETIMEOFFSET()
+WHEN NOT MATCHED BY TARGET THEN
+    INSERT (StateName, LastRecordId, LastSystemModstamp, LastUpdatedDateTime)
+    VALUES (S.StateName, NULL, S.TargetModstamp, SYSDATETIMEOFFSET());
