@@ -151,7 +151,7 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
 
     try:
         # --- Read Batch Size from Environment Variable ---
-        db_batch_size_str = os.environ.get('AZURE_DB_BATCH_SIZE', '5') 
+        db_batch_size_str = os.environ.get('AZURE_DB_BATCH_SIZE', '50') 
         try:
             db_batch_size = int(db_batch_size_str)
             if db_batch_size <= 0:
