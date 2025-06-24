@@ -74,42 +74,25 @@ BEGIN
 END
 GO
 
--- Create the SyncState table if it does not exist, or alter it if it exists with old column names
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[SyncState]') AND type in (N'U'))
-BEGIN
-    PRINT 'Creating table [dbo].[SyncState] with generic columns...'
-    CREATE TABLE [dbo].[SyncState](
-        [StateName] NVARCHAR(50) NOT NULL PRIMARY KEY, -- A unique name for each sync process (e.g., 'ContentVersionSync', 'AccountSync')
-        [LastRecordId] NVARCHAR(18) NULL,             -- The Salesforce 18-char Id of the last processed record for this StateName (generic)
-        [LastSystemModstamp] DATETIMEOFFSET(7) NULL,   -- The SystemModstamp of the last processed record, for robust chronological syncing (generic)
-        [LastUpdatedDateTime] DATETIMEOFFSET(7) DEFAULT SYSDATETIMEOFFSET() -- When this specific state record was last updated
-    ) ON [PRIMARY]
-    PRINT 'Table [dbo].[SyncState] created successfully.'
-END
-ELSE
-BEGIN
-    PRINT 'Table [dbo].[SyncState] already exists. Checking for schema updates...'
-
-    -- Check if the old column 'LastContentVersionId' exists and drop it
-    IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[SyncState]') AND name = N'LastContentVersionId')
-    BEGIN
-        PRINT 'Dropping old column [LastContentVersionId] from [dbo].[SyncState]...'
-        ALTER TABLE [dbo].[SyncState] DROP COLUMN [LastContentVersionId];
-        PRINT 'Old column [LastContentVersionId] dropped.'
-    END
-
-    -- Check if the new column 'LastRecordId' exists and add it if not
-    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[SyncState]') AND name = N'LastRecordId')
-    BEGIN
-        PRINT 'Adding new column [LastRecordId] to [dbo].[SyncState]...'
-        ALTER TABLE [dbo].[SyncState] ADD [LastRecordId] NVARCHAR(18) NULL;
-        PRINT 'New column [LastRecordId] added.'
-    END
-
-    -- Ensure LastSystemModstamp is DATETIMEOFFSET(7) (if type conversion is needed)
-    -- This part is illustrative, full type alteration with data conversion is more complex.
-    -- For simplicity, assume LastSystemModstamp is already correct from previous versions.
-END
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+CREATE TABLE [dbo].[SyncState](
+	[StateName] [nvarchar](50) NOT NULL,
+	[LastRecordId] [nvarchar](18) NULL,
+	[LastSystemModstamp] [datetimeoffset](7) NULL,
+	[LastUpdatedDateTime] [datetimeoffset](7) NULL
+) ON [PRIMARY]
+GO
+SET ANSI_PADDING ON
+GO
+ALTER TABLE [dbo].[SyncState] ADD PRIMARY KEY CLUSTERED 
+(
+	[StateName] ASC
+)WITH (STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ONLINE = OFF, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+GO
+ALTER TABLE [dbo].[SyncState] ADD  DEFAULT (sysdatetimeoffset()) FOR [LastUpdatedDateTime]
 GO
 
 -- Optional: Ensure a record for 'ContentVersionSync' exists in the SyncState table.
@@ -136,6 +119,26 @@ WHEN MATCHED THEN
 WHEN NOT MATCHED BY TARGET THEN
     INSERT (StateName, LastRecordId, LastSystemModstamp, LastUpdatedDateTime)
     VALUES (S.StateName, NULL, S.TargetModstamp, SYSDATETIMEOFFSET());
+
+
+-- ContentDocumentLinkSync
+
+-- SQL to update the SyncState for 'ContentDocumentLinkSync' to June 15th, 2025, 4:00:00 AM UTC.
+-- This MERGE statement will UPDATE the row if 'ContentDocumentLinkSync' exists,
+-- or INSERT it if it does not exist.
+
+MERGE INTO [dbo].[SyncState] AS T
+USING (SELECT 'ContentDocumentLinkSync' AS StateName, '2024-01-01T04:00:00.000Z' AS TargetModstamp) AS S
+ON T.StateName = S.StateName
+WHEN MATCHED THEN
+    UPDATE SET
+        T.LastSystemModstamp = S.TargetModstamp,
+        T.LastUpdatedDateTime = SYSDATETIMEOFFSET()
+WHEN NOT MATCHED BY TARGET THEN
+    INSERT (StateName, LastRecordId, LastSystemModstamp, LastUpdatedDateTime)
+    VALUES (S.StateName, NULL, S.TargetModstamp, SYSDATETIMEOFFSET());
+
+
 
 SET ANSI_NULLS ON
 GO
