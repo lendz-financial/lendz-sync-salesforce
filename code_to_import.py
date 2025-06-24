@@ -7,10 +7,6 @@ import pyodbc
 from simple_salesforce import Salesforce, SalesforceError
 from datetime import datetime, timezone, timedelta
 
-# Azure Blob Storage imports
-from azure.storage.blob import BlobServiceClient
-from azure.core.exceptions import ResourceNotFoundError, ClientAuthenticationError
-
 def helper_code() -> None:
     logging.info("Helper code function successfully executed. AB")
     
@@ -129,7 +125,14 @@ def _get_last_sync_timestamp_from_db(cursor, state_name):
     Returns the timestamp in Salesforce's Besançon-MM-DDTHH:MM:SS.sssZ format, or None if not found.
     """
     # SQL query applying Option 1: Convert LastSystemModstamp to UTC DATETIME
-    select_sql = "SELECT CAST(LastSystemModstamp AT TIME ZONE 'UTC' AS DATETIME) AS LastSystemModstampUtcDateTime FROM [dbo].[SyncState] WHERE StateName = ?"
+    select_sql = """
+    SELECT
+        CAST(LastSystemModstamp AT TIME ZONE 'UTC' AS DATETIME) AS LastSystemModstampUtcDateTime
+    FROM
+        [dbo].[SyncState]
+    WHERE
+        StateName = ?
+    """
     try:
         cursor.execute(select_sql, state_name)
         result = cursor.fetchone()
@@ -187,7 +190,7 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
 
     try:
         # --- Read Batch Size from Environment Variable ---
-        db_batch_size_str = os.environ.get('AZURE_DB_BATCH_SIZE', '50') # Changed default to '5'
+        db_batch_size_str = os.environ.get('AZURE_DB_BATCH_SIZE', '50') 
         try:
             db_batch_size = int(db_batch_size_str)
             if db_batch_size <= 0:
@@ -269,7 +272,8 @@ def download_content_versions_and_files_to_azure_blob_and_sql_batched(
             f"ContentSize, FileExtension, FirstPublishLocationId, Origin, NetworkId, "
             f"ContentLocation, TextPreview, ExternalDocumentInfo1, ExternalDocumentInfo2, "
             f"Checksum, IsMajorVersion, IsAssetEnabled, VersionDataUrl "
-            f"FROM ContentVersion WHERE SystemModstamp > {soql_start_timestamp}" 
+            f"FROM ContentVersion WHERE SystemModstamp > {soql_start_timestamp} "
+            f"ORDER BY SystemModstamp ASC" # Added ORDER BY clause
         )
         print(f"Executing SOQL query: {soql_query}")
 
@@ -523,7 +527,7 @@ def download_content_document_links_to_sql_batched(
 
     try:
         # --- Read Batch Size from Environment Variable ---
-        db_batch_size_str = os.environ.get('AZURE_DB_BATCH_SIZE', '5') # Changed default to '5'
+        db_batch_size_str = os.environ.get('AZURE_DB_BATCH_SIZE', '50') 
         try:
             db_batch_size = int(db_batch_size_str)
             if db_batch_size <= 0:
@@ -564,7 +568,8 @@ def download_content_document_links_to_sql_batched(
         # Select fields matching the [dbo].[ContentDocumentLink] table structure
         soql_query = (
             f"SELECT Id, LinkedEntityId, ContentDocumentId, IsDeleted, SystemModstamp, ShareType, Visibility "
-            f"FROM ContentDocumentLink WHERE SystemModstamp > {soql_start_timestamp}"
+            f"FROM ContentDocumentLink WHERE SystemModstamp > {soql_start_timestamp} "
+            f"ORDER BY SystemModstamp ASC" # Added ORDER BY clause
         )
         print(f"Executing SOQL query: {soql_query}")
 
@@ -584,7 +589,8 @@ def download_content_document_links_to_sql_batched(
             linked_entity_id = record.get('LinkedEntityId')
             content_document_id = record.get('ContentDocumentId')
             is_deleted = record.get('IsDeleted')
-            system_modstamp_str = record.get('SystemModstamp') # Salesforce ISO 8601 string
+            # Changed variable name to reflect it's milliseconds (int)
+            system_modstamp_ms = record.get('SystemModstamp') 
 
             share_type = record.get('ShareType')
             visibility = record.get('Visibility')
@@ -594,10 +600,11 @@ def download_content_document_links_to_sql_batched(
             record['LastSystemModstampInBatch'] = None
             record['ProcessingError'] = None
 
-            if cdl_id and content_document_id and system_modstamp_str is not None:
+            # Changed check to system_modstamp_ms
+            if cdl_id and content_document_id and system_modstamp_ms is not None:
                 try:
-                    # Convert Salesforce ISO timestamp string to Python datetime object for SQL
-                    system_modstamp_dt = datetime.fromisoformat(system_modstamp_str.replace('Z', '+00:00'))
+                    # Corrected: Convert milliseconds since epoch to UTC datetime object
+                    system_modstamp_dt = datetime.fromtimestamp(float(system_modstamp_ms) / 1000, tz=timezone.utc)
 
                     # Add to SQL DB Update Batch
                     db_update_batch.append((
@@ -618,7 +625,7 @@ def download_content_document_links_to_sql_batched(
                             last_record_id_in_batch = None
                             
                             for batch_item in db_update_batch:
-                                current_modstamp_dt = batch_item[4] # SystemModstamp is at index 4
+                                current_modstamp_dt = batch_item[4] # SystemModstamp (datetime object) is at index 4
                                 current_record_id = batch_item[0] # Id is at index 0
 
                                 if max_modstamp_in_batch is None or current_modstamp_dt > max_modstamp_in_batch:
@@ -654,7 +661,8 @@ def download_content_document_links_to_sql_batched(
                 reason = ""
                 if not cdl_id: reason += "No Id. "
                 if not content_document_id: reason += "No ContentDocumentId. "
-                if system_modstamp_str is None: reason += "No SystemModstamp. "
+                # Changed variable name in message
+                if system_modstamp_ms is None: reason += "No SystemModstamp. " 
                 record['ProcessingError'] = f"Skipped: {reason.strip()}"
                 record['SqlUpdateStatus'] = 'Not Attempted (Missing Data)'
             
@@ -783,7 +791,7 @@ if __name__ == "__main__":
     # else:
     #     print("ContentVersion sync terminated due to a critical error.")
 
-    print(f"\n{'='*50}\n") # Separator for clarity
+    # print(f"\n{'='*50}\n") # Separator for clarity
 
     print(f"Starting ContentDocumentLink sync process.")
     # Call the new ContentDocumentLink sync function
