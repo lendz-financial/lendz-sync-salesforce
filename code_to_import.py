@@ -4,6 +4,8 @@ from io import StringIO, BytesIO
 import os
 import requests
 import pyodbc
+from azure.core.exceptions import ResourceNotFoundError, ClientAuthenticationError
+from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
 from simple_salesforce import Salesforce, SalesforceError
 from datetime import datetime, timezone, timedelta
 
@@ -761,63 +763,63 @@ if __name__ == "__main__":
     INITIAL_LAST_SYNC_TIMESTAMP = '2024-01-01T00:00:00Z' 
     IS_SANDBOX = False 
 
-    # print(f"Starting ContentVersion sync process.")
+    print(f"Starting ContentVersion sync process.")
     
-    # # Call the ContentVersion sync function
-    # content_version_results = download_content_versions_and_files_to_azure_blob_and_sql_batched(
-    #     SF_USERNAME, 
-    #     SF_PASSWORD, 
-    #     SF_SECURITY_TOKEN, 
-    #     INITIAL_LAST_SYNC_TIMESTAMP, 
-    #     sandbox=IS_SANDBOX
-    # )
-
-    # if content_version_results is not None:
-    #     print("\nFinal Processed ContentVersion Data (first 5 records):")
-    #     if content_version_results:
-    #         for i, record in enumerate(content_version_results[:5]):
-    #             print(f"Record {i+1}:")
-    #             print(f"    Id: {record.get('Id')}")
-    #             print(f"    Title: {record.get('Title')}")
-    #             print(f"    FileExtension: {record.get('FileExtension')}")
-    #             print(f"    AzureBlobUrl: {record.get('AzureBlobUrl')}")
-    #             print(f"    SqlUpdateStatus: {record.get('SqlUpdateStatus')}")
-    #             print(f"    LastSystemModstampInBatch: {record.get('LastSystemModstampInBatch')}")
-    #             print(f"    DownloadError: {record.get('DownloadError')}")
-    #             print("-" * 20)
-    #     else:
-    #         print("No ContentVersion records to display.")
-    #     print(f"\nTotal ContentVersion records processed by script: {len(content_version_results) if content_version_results else 0}")
-    # else:
-    #     print("ContentVersion sync terminated due to a critical error.")
-
-    # print(f"\n{'='*50}\n") # Separator for clarity
-
-    print(f"Starting ContentDocumentLink sync process.")
-    # Call the new ContentDocumentLink sync function
-    content_document_link_results = download_content_document_links_to_sql_batched(
-        SF_USERNAME,
-        SF_PASSWORD,
-        SF_SECURITY_TOKEN,
-        INITIAL_LAST_SYNC_TIMESTAMP,
+    # Call the ContentVersion sync function
+    content_version_results = download_content_versions_and_files_to_azure_blob_and_sql_batched(
+        SF_USERNAME, 
+        SF_PASSWORD, 
+        SF_SECURITY_TOKEN, 
+        INITIAL_LAST_SYNC_TIMESTAMP, 
         sandbox=IS_SANDBOX
     )
 
-    if content_document_link_results is not None:
-        print("\nFinal Processed ContentDocumentLink Data (first 5 records):")
-        if content_document_link_results:
-            for i, record in enumerate(content_document_link_results[:5]):
+    if content_version_results is not None:
+        print("\nFinal Processed ContentVersion Data (first 5 records):")
+        if content_version_results:
+            for i, record in enumerate(content_version_results[:5]):
                 print(f"Record {i+1}:")
                 print(f"    Id: {record.get('Id')}")
-                print(f"    LinkedEntityId: {record.get('LinkedEntityId')}")
-                print(f"    ContentDocumentId: {record.get('ContentDocumentId')}")
-                print(f"    IsDeleted: {record.get('IsDeleted')}")
+                print(f"    Title: {record.get('Title')}")
+                print(f"    FileExtension: {record.get('FileExtension')}")
+                print(f"    AzureBlobUrl: {record.get('AzureBlobUrl')}")
                 print(f"    SqlUpdateStatus: {record.get('SqlUpdateStatus')}")
                 print(f"    LastSystemModstampInBatch: {record.get('LastSystemModstampInBatch')}")
-                print(f"    ProcessingError: {record.get('ProcessingError')}")
+                print(f"    DownloadError: {record.get('DownloadError')}")
                 print("-" * 20)
         else:
-            print("No ContentDocumentLink records to display.")
-        print(f"\nTotal ContentDocumentLink records processed by script: {len(content_document_link_results) if content_document_link_results else 0}")
+            print("No ContentVersion records to display.")
+        print(f"\nTotal ContentVersion records processed by script: {len(content_version_results) if content_version_results else 0}")
     else:
-        print("ContentDocumentLink sync terminated due to a critical error.")
+        print("ContentVersion sync terminated due to a critical error.")
+
+    # print(f"\n{'='*50}\n") # Separator for clarity
+
+    # print(f"Starting ContentDocumentLink sync process.")
+    # # Call the new ContentDocumentLink sync function
+    # content_document_link_results = download_content_document_links_to_sql_batched(
+    #     SF_USERNAME,
+    #     SF_PASSWORD,
+    #     SF_SECURITY_TOKEN,
+    #     INITIAL_LAST_SYNC_TIMESTAMP,
+    #     sandbox=IS_SANDBOX
+    # )
+
+    # if content_document_link_results is not None:
+    #     print("\nFinal Processed ContentDocumentLink Data (first 5 records):")
+    #     if content_document_link_results:
+    #         for i, record in enumerate(content_document_link_results[:5]):
+    #             print(f"Record {i+1}:")
+    #             print(f"    Id: {record.get('Id')}")
+    #             print(f"    LinkedEntityId: {record.get('LinkedEntityId')}")
+    #             print(f"    ContentDocumentId: {record.get('ContentDocumentId')}")
+    #             print(f"    IsDeleted: {record.get('IsDeleted')}")
+    #             print(f"    SqlUpdateStatus: {record.get('SqlUpdateStatus')}")
+    #             print(f"    LastSystemModstampInBatch: {record.get('LastSystemModstampInBatch')}")
+    #             print(f"    ProcessingError: {record.get('ProcessingError')}")
+    #             print("-" * 20)
+    #     else:
+    #         print("No ContentDocumentLink records to display.")
+    #     print(f"\nTotal ContentDocumentLink records processed by script: {len(content_document_link_results) if content_document_link_results else 0}")
+    # else:
+    #     print("ContentDocumentLink sync terminated due to a critical error.")
